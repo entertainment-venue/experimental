@@ -18,6 +18,11 @@ package reconciler
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"net"
+	"net/http"
 	"time"
 
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1"
@@ -55,21 +60,34 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 		r.Status.MarkRunFailed("MissingDuration", "The duration param was not passed")
 		return nil
 	}
-	if len(r.Spec.Params) != 1 {
+	dur, err := time.ParseDuration(expr.Value.StringVal)
+	if err != nil {
+		r.Status.MarkRunFailed("InvalidDuration", "The duration param was invalid: %v", err)
+		return nil
+	}
+
+	// feat: 增加httpEndpoint和pipelineId参数
+	var httpEndpointStr string
+	httpEndpoint := r.Spec.GetParam("httpEndpoint")
+	if httpEndpoint != nil && httpEndpoint.Value.StringVal != "" {
+		httpEndpointStr = httpEndpoint.Value.StringVal
+	}
+	var pipelineIdStr string
+	pipelineId := r.Spec.GetParam("pipelineId")
+	if pipelineId != nil && pipelineId.Value.StringVal != "" {
+		pipelineIdStr = pipelineId.Value.StringVal
+	}
+
+	// 参数校验只在多的时候起作用
+	if len(r.Spec.Params) > 3 {
 		var found []string
 		for _, p := range r.Spec.Params {
-			if p.Name == "duration" {
+			if p.Name == "duration" || p.Name == "httpEndpoint" || p.Name == "pipelineId" {
 				continue
 			}
 			found = append(found, p.Name)
 		}
 		r.Status.MarkRunFailed("UnexpectedParams", "Found unexpected params: %v", found)
-		return nil
-	}
-
-	dur, err := time.ParseDuration(expr.Value.StringVal)
-	if err != nil {
-		r.Status.MarkRunFailed("InvalidDuration", "The duration param was invalid: %v", err)
 		return nil
 	}
 
@@ -81,15 +99,74 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 
 	done := r.Status.StartTime.Time.Add(dur)
 
-	if time.Now().After(done) {
-		now := metav1.Now()
-		r.Status.CompletionTime = &now
-		r.Status.MarkRunSucceeded("DurationElapsed", "The wait duration has elapsed")
-	} else {
-		// Enqueue another check when the timeout should be elapsed.
+	// 增加httpEndpoint属性，获取当前任务状态
+	if httpEndpointStr != "" && pipelineIdStr != "" {
+		urlStr := fmt.Sprintf("%s?pipelineId=%s", httpEndpoint, pipelineId)
+		resp, err := httpClient().Get(urlStr)
+		if err != nil {
+			// requeue
+			r.Status.MarkRunRunning("UnexpectedHttpErr", fmt.Sprintf("Failed to check http endpoint %s", urlStr))
+			return controller.NewRequeueAfter(time.Until(r.Status.StartTime.Time.Add(dur)))
+		}
+
+		// 解析resp，判断是否可以继续当前的pipeline
+		defer resp.Body.Close()
+
+		b, _ := ioutil.ReadAll(resp.Body)
+		hr := httpResponse{}
+		if err := json.Unmarshal(b, &hr); err != nil {
+			// requeue
+			r.Status.MarkRunRunning("UnexpectedResponse", fmt.Sprintf("url %s response %s", urlStr, string(b)))
+			return controller.NewRequeueAfter(time.Until(r.Status.StartTime.Time.Add(dur)))
+		}
+		if hr.Status == Success || hr.Status == Fail {
+			now := metav1.Now()
+			r.Status.CompletionTime = &now
+			r.Status.MarkRunSucceeded(hr.Status, hr.Reason)
+			return nil
+		}
+
+		// requeue
+		r.Status.MarkRunRunning("Checking", fmt.Sprintf("Got response %s %s", urlStr, string(b)))
 		return controller.NewRequeueAfter(time.Until(r.Status.StartTime.Time.Add(dur)))
+	} else {
+		if time.Now().After(done) {
+			now := metav1.Now()
+			r.Status.CompletionTime = &now
+			r.Status.MarkRunSucceeded("DurationElapsed", "The wait duration has elapsed")
+		} else {
+			// Enqueue another check when the timeout should be elapsed.
+			return controller.NewRequeueAfter(time.Until(r.Status.StartTime.Time.Add(dur)))
+		}
 	}
 
 	// Don't emit events on nop-reconciliations, it causes scale problems.
 	return nil
+}
+
+const (
+	Success = "SUCCESS"
+	Fail    = "FAIL"
+)
+
+type httpResponse struct {
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+}
+
+func httpClient() *http.Client {
+	httpDialContextFunc := (&net.Dialer{Timeout: 1 * time.Second, DualStack: true}).DialContext
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: httpDialContextFunc,
+
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 0,
+
+			MaxIdleConns:        50,
+			MaxIdleConnsPerHost: 50,
+		},
+		Timeout: 3 * time.Second,
+	}
 }
