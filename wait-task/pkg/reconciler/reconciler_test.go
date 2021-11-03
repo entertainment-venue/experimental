@@ -167,3 +167,56 @@ func TestReconcile_Failure(t *testing.T) {
 		})
 	}
 }
+
+func TestReconcile_httpEndpoint(t *testing.T) {
+	ctx := context.Background()
+	r := &v1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "run",
+		},
+		Spec: v1alpha1.RunSpec{
+			Ref: validRef,
+			Params: []v1beta1.Param{
+				{
+					Name:  "duration",
+					Value: *v1beta1.NewArrayOrString("10s"),
+				},
+				{
+					Name:  "httpEndpoint",
+					Value: *v1beta1.NewArrayOrString("http://10.189.73.122:9900/jsonhello"),
+				},
+				{
+					Name:  "pipelineId",
+					Value: *v1beta1.NewArrayOrString("foo"),
+				},
+			},
+		},
+	}
+	rec := &Reconciler{}
+
+	// Start reconciling the Run.
+	if err := rec.ReconcileKind(ctx, r); err != nil {
+		t.Fatal("wanted error, got nil")
+	} else if ok, dur := controller.IsRequeueKey(err); !ok {
+		t.Fatalf("wanted requeue error, got %v", err)
+	} else {
+		// Simulate EnqueueAfter
+		time.Sleep(dur)
+	}
+
+	// Reconcile again after sleeping.
+	if err := rec.ReconcileKind(ctx, r); err != nil {
+		t.Fatalf("ReconcileKind() = %v", err)
+	}
+
+	// At this point it should have been successful.
+	if !r.IsSuccessful() {
+		t.Errorf("Run was not successful after second reconcile: %v", r.Status.GetCondition(apis.ConditionSucceeded).Status)
+	}
+
+	// Reconciling into the final completed state should take <2s.
+	dur := r.Status.CompletionTime.Time.Sub(r.Status.StartTime.Time)
+	if dur > 2*time.Second {
+		t.Fatalf("completion_time - start_time > 2s: %s", dur)
+	}
+}

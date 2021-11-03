@@ -7,5 +7,9 @@ spec:
     apiVersion: example.dev/v0
     kind: Wait
   params:
-  - name: duration
-    value: 10s
+    - name: duration
+      value: 10s
+    - name: httpEndpoint
+      value: http://domainname/path
+    - name: pipelineId
+      value: foo
