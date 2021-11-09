@@ -131,6 +131,9 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 			now := metav1.Now()
 			r.Status.CompletionTime = &now
 			r.Status.MarkRunSucceeded(hr.Status, hr.Reason)
+
+			// feat: 支持结果传递，wait-task
+			r.Status.Results = append(r.Status.Results, hr.Kvs...)
 			return nil
 		}
 
@@ -162,6 +165,15 @@ const (
 type httpResponse struct {
 	Status string `json:"status"`
 	Reason string `json:"reason"`
+
+	// pre-publish/publish场景：
+	// []*v1alpha1.RunResult{
+	// 	{"name": "JENKINS_JOB_NAME", "value": ""},
+	// 	{"name": "JENKINS_BUILD_NO", "value": ""},
+	// 	{"name": "JENKINS_BUILD_URL", "value": ""},
+	// 	{"name": "JENKINS_BUILD_TYPE", "value": ""},
+	// }
+	Kvs []v1alpha1.RunResult `json:"kvs"`
 }
 
 func httpClient() *http.Client {
