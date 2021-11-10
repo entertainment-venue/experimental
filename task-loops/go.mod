@@ -4,7 +4,8 @@ go 1.13
 
 require (
 	github.com/ghodss/yaml v1.0.0
-	github.com/google/go-cmp v0.5.4
+	github.com/golang/protobuf v1.5.2 // indirect
+	github.com/google/go-cmp v0.5.5
 	github.com/hashicorp/go-multierror v1.1.0
 	github.com/tektoncd/pipeline v0.20.1
 	go.opencensus.io v0.22.5

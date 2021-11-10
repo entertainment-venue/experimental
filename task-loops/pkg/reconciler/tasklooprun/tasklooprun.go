@@ -186,85 +186,51 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 		return nil
 	}
 
-	// Determine how many iterations of the Task will be done.
-	totalIterations, err := computeIterations(run, taskLoopSpec)
+	if status.TaskRuns == nil {
+		status.TaskRuns = make(map[string]*taskloopv1alpha1.TaskLoopTaskRunStatus)
+	}
+
+	// feat: 支持根据脚本执行results，如果成功，继续完成当前task；如果失败，requeue + duration，然后重新执行并判断脚本执行结果
+	var requeue bool
+	taskRunLabels := getTaskRunLabels(run, "", false)
+	taskRuns, err := c.taskRunLister.TaskRuns(run.Namespace).List(labels.SelectorFromSet(taskRunLabels))
 	if err != nil {
-		run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(),
-			"Cannot determine number of iterations: %s", err)
-		return nil
+		return err
 	}
+	if taskRuns != nil && len(taskRuns) > 0 {
+		// 证明之前有过taskrun，这里需要对任务的结果进行校验，确定是否，需要把任务重新扔回队列
+		lastRun := taskRuns[len(taskRuns)-1]
+		if lastRun.Spec.Params == nil && len(lastRun.Spec.Params) != 1 {
+			return fmt.Errorf("unexpected error: empty params [%+v]", lastRun.Spec.Params)
+		}
+		lastRunParam := lastRun.Spec.Params[0]
+		if lastRunParam.Name != "RESULT_SCRIPT_EXECUTE_STATUS" {
+			return fmt.Errorf("unexpected script error: invalid script result name [%+v]", lastRunParam)
+		}
+		if lastRunParam.Value.StringVal == "SUCCESS" {
+			run.Status.MarkRunSucceeded(taskloopv1alpha1.TaskLoopRunReasonSucceeded.String(),
+				"All TaskRuns completed successfully")
+			return nil
+		}
 
-	// Update the status of the TaskRuns created from this Run on prior reconciliations.
-	// updateTaskRunStatus() also handles TaskRun cancellation and retry.
-	// It returns the total number of TaskRuns that are running now, the highest
-	// iteration number processed so far, and an indicator whether any TaskRun has failed.
-	totalRunning, highestIteration, taskRunFailed, err := c.updateTaskRunStatus(ctx, logger, run, status, taskLoopSpec)
+		// 新的taskrun在10s后执行
+		requeue = true
+	}
+	tr, err := c.createTaskRun(ctx, logger, taskLoopSpec, run, 1)
 	if err != nil {
-		return fmt.Errorf("error updating TaskRun status for Run %s/%s: %w", run.Namespace, run.Name, err)
+		return fmt.Errorf("error creating TaskRun from Run %s: %w", run.Name, err)
 	}
-
-	// Check if the run was cancelled.  Since updateTaskRunStatus() handled cancelling any running TaskRuns
-	// the only thing to do here is to determine if all running TaskRuns have finished.
-	if run.IsCancelled() {
-		// If no TaskRuns are running, mark the Run as failed.
-		if totalRunning == 0 {
-			run.Status.MarkRunFailed(v1alpha1.RunReasonCancelled,
-				"Run %s/%s was cancelled", run.Namespace, run.Name)
-		} else {
-			// The Run is still running until the TaskRuns process their cancel requests.
-			run.Status.MarkRunRunning(taskloopv1alpha1.TaskLoopRunReasonRunning.String(),
-				"Cancelling TaskRuns")
-		}
-		return nil
+	status.TaskRuns[tr.Name] = &taskloopv1alpha1.TaskLoopTaskRunStatus{
+		Iteration: 1,
+		Status:    &tr.Status,
 	}
-
-	// Check if the Run is done.
-	//   1) TaskRuns were created for all iterations OR a TaskRun has failed.
-	//      (TaskRun failure stops submission of any remaining iterations.)
-	//   2) All TaskRuns are done.  If there are TaskRuns running then wait
-	//      for them to complete before marking the Run complete.
-	if highestIteration == totalIterations || taskRunFailed {
-		if totalRunning == 0 {
-			if taskRunFailed {
-				run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailed.String(),
-					"One or more TaskRuns have failed")
-			} else {
-				run.Status.MarkRunSucceeded(taskloopv1alpha1.TaskLoopRunReasonSucceeded.String(),
-					"All TaskRuns completed successfully")
-			}
-		} else {
-			// Update number of iterations completed.
-			run.Status.MarkRunRunning(taskloopv1alpha1.TaskLoopRunReasonRunning.String(),
-				"Iterations completed: %d", highestIteration-totalRunning)
-		}
-		return nil
-	}
-
-	// Create TaskRuns for the next iterations.  Continue creating them until the concurrency
-	// limit is reached.  If the limit is unspecified, it defaults to 1 (sequential execution).
-	// If the limit is 0 or negative, then TaskRuns are created for all iterations at once.
-	nextIteration := highestIteration + 1
-	concurrency := 1
-	if taskLoopSpec.Concurrency != nil {
-		concurrency = *taskLoopSpec.Concurrency
-	}
-	for nextIteration <= totalIterations && (concurrency <= 0 || totalRunning < concurrency) {
-		// Create a TaskRun to run the next iteration.
-		tr, err := c.createTaskRun(ctx, logger, taskLoopSpec, run, nextIteration)
-		if err != nil {
-			return fmt.Errorf("error creating TaskRun from Run %s: %w", run.Name, err)
-		}
-		status.TaskRuns[tr.Name] = &taskloopv1alpha1.TaskLoopTaskRunStatus{
-			Iteration: nextIteration,
-			Status:    &tr.Status,
-		}
-		totalRunning++
-		nextIteration++
-	}
-
 	run.Status.MarkRunRunning(taskloopv1alpha1.TaskLoopRunReasonRunning.String(),
-		"Iterations completed: %d", nextIteration-totalRunning-1)
-
+		"Loop task run: %s", tr.Name)
+	if requeue {
+		logger.Infof("start wait param: [%+v] tr: [%+v]", run.Spec.Params, tr)
+		// TODO 使用和wait-task同样机制vendor过不去
+		time.Sleep(10 * time.Second)
+	}
 	return nil
 }
 
@@ -455,24 +421,6 @@ func (c *Reconciler) processTaskRun(ctx context.Context, logger *zap.SugaredLogg
 		}
 	}
 	return nil
-}
-
-func computeIterations(run *v1alpha1.Run, tls *taskloopv1alpha1.TaskLoopSpec) (int, error) {
-	// Find the iterate parameter.
-	numberOfIterations := -1
-	for _, p := range run.Spec.Params {
-		if p.Name == tls.IterateParam {
-			if p.Value.Type == v1beta1.ParamTypeString {
-				// If we got a string param, split it into an array, one item per line
-				p.Value.ArrayVal = strings.Split(strings.TrimSuffix(p.Value.StringVal, "\n"), "\n")
-			}
-			numberOfIterations = len(p.Value.ArrayVal)
-		}
-	}
-	if numberOfIterations == -1 {
-		return 0, fmt.Errorf("The iterate parameter %q was not found", tls.IterateParam)
-	}
-	return numberOfIterations, nil
 }
 
 func getParameters(run *v1alpha1.Run, tls *taskloopv1alpha1.TaskLoopSpec, iteration int) []v1beta1.Param {
