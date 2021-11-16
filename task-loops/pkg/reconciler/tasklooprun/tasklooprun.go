@@ -199,7 +199,7 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 	if err != nil {
 		terr := fmt.Errorf("get TaskRuns, run: [%s] err: %s", run.Name, err)
 		run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
-		return terr
+		return nil
 	}
 	if len(taskRuns) == 0 {
 		// 只云运行一次taskrun，否则会启动多个pod
@@ -207,7 +207,7 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 		if err != nil {
 			terr := fmt.Errorf("error creating TaskRun from run: [%s] err: [%w]", run.Name, err)
 			run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
-			return terr
+			return nil
 		}
 		status.TaskRuns[tr.Name] = &taskloopv1alpha1.TaskLoopTaskRunStatus{
 			Iteration: 1,
@@ -230,7 +230,7 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 		if err != nil {
 			terr := fmt.Errorf("Error converting iteration number in TaskRun %s:  %s", tr.Name, err)
 			run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
-			return terr
+			return nil
 		}
 		status.TaskRuns[tr.Name] = &taskloopv1alpha1.TaskLoopTaskRunStatus{
 			Iteration: iteration,
@@ -263,13 +263,13 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 		if taskRunResults == nil || len(taskRunResults) != 1 {
 			terr := fmt.Errorf("unexpected error TaskRunResults should be one, run: [%s] TaskRunResults: [%v]", run.Name, taskRunResults)
 			run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
-			return terr
+			return nil
 		}
 		lastTaskRunResult := taskRunResults[len(taskRunResults)-1]
 		if lastTaskRunResult.Name != "status" {
 			terr := fmt.Errorf("unexpected script error, invalid script result name, run: [%s] lastTaskRunResult: [%+v]", run.Name, lastTaskRunResult)
 			run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
-			return terr
+			return nil
 		}
 		if strings.TrimSpace(lastTaskRunResult.Value) == "SUCCESS" {
 			run.Status.MarkRunSucceeded(taskloopv1alpha1.TaskLoopRunReasonSucceeded.String(), "All TaskRuns completed successfully %s", run.Name)
@@ -300,12 +300,12 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 	if err != nil {
 		logger.Errorf("")
 		run.Status.MarkRunFailed("UnexpectedHttpErr", fmt.Sprintf("Failed to check http endpoint %s", urlStr))
-		return err
+		return nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		run.Status.MarkRunFailed("UnexpectedHttpStatusCode", fmt.Sprintf("Failed to check http endpoint %s status code %d", urlStr, resp.StatusCode))
-		return err
+		return nil
 	}
 
 	b, _ := ioutil.ReadAll(resp.Body)
@@ -313,7 +313,7 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 	hr := httpResponse{}
 	if err := json.Unmarshal(b, &hr); err != nil {
 		run.Status.MarkRunFailed("UnexpectedResponse", fmt.Sprintf("url %s response %s", urlStr, string(b)))
-		return err
+		return nil
 	}
 
 	// http response处理
@@ -321,11 +321,17 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 		logger.Infof("http response pending continue wait, run %s", run.Name)
 		run.Status.MarkRunRunning("PendingResponse", fmt.Sprintf("url %s response %s", urlStr, string(b)))
 		return nil
+	} else if hr.Status == Fail {
+		err := fmt.Errorf("not approval, url: %s response: %s", urlStr, string(b))
+		run.Status.MarkRunFailed("NotApproval", err.Error())
+		return nil
 	}
-	if hr.Status != Success && hr.Status != Fail {
-		err := fmt.Errorf("unexpected http response url: %s response: %s", urlStr, string(b))
+
+	// Status状态未知，直接标记失败
+	if hr.Status != Success {
+		err := fmt.Errorf("unexpected status url: %s response: %s", urlStr, string(b))
 		run.Status.MarkRunFailed("UnexpectedStatus", err.Error())
-		return err
+		return nil
 	}
 
 	// 等待
