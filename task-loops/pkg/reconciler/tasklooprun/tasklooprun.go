@@ -20,7 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net"
+	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
@@ -191,47 +194,191 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 	}
 
 	// feat: 支持根据脚本执行results，如果成功，继续完成当前task；如果失败，requeue + duration，然后重新执行并判断脚本执行结果
-	var requeue bool
 	taskRunLabels := getTaskRunLabels(run, "", false)
 	taskRuns, err := c.taskRunLister.TaskRuns(run.Namespace).List(labels.SelectorFromSet(taskRunLabels))
 	if err != nil {
-		return err
+		terr := fmt.Errorf("get TaskRuns, run: [%s] err: %s", run.Name, err)
+		run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
+		return terr
 	}
-	if taskRuns != nil && len(taskRuns) > 0 {
-		// 证明之前有过taskrun，这里需要对任务的结果进行校验，确定是否，需要把任务重新扔回队列
-		lastRun := taskRuns[len(taskRuns)-1]
-		if lastRun.Spec.Params == nil && len(lastRun.Spec.Params) != 1 {
-			return fmt.Errorf("unexpected error: empty params [%+v]", lastRun.Spec.Params)
+	if len(taskRuns) == 0 {
+		// 只云运行一次taskrun，否则会启动多个pod
+		tr, err := c.createTaskRun(ctx, logger, taskLoopSpec, run, 1)
+		if err != nil {
+			terr := fmt.Errorf("error creating TaskRun from run: [%s] err: [%w]", run.Name, err)
+			run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
+			return terr
 		}
-		lastRunParam := lastRun.Spec.Params[0]
-		if lastRunParam.Name != "RESULT_SCRIPT_EXECUTE_STATUS" {
-			return fmt.Errorf("unexpected script error: invalid script result name [%+v]", lastRunParam)
+		status.TaskRuns[tr.Name] = &taskloopv1alpha1.TaskLoopTaskRunStatus{
+			Iteration: 1,
+			Status:    &tr.Status,
 		}
-		if lastRunParam.Value.StringVal == "SUCCESS" {
-			run.Status.MarkRunSucceeded(taskloopv1alpha1.TaskLoopRunReasonSucceeded.String(),
-				"All TaskRuns completed successfully")
+		logger.Infof("create first TaskRun success run: [%s] tr: [%s] status: [%+v]", run.Name, tr.Name, tr.Status)
+		run.Status.MarkRunRunning(taskloopv1alpha1.TaskLoopRunReasonRunning.String(), "Loop task running: %s", run.Name)
+		return nil
+	}
+
+	var (
+		currentIteration int
+		lastTaskRun      *v1beta1.TaskRun
+	)
+	logger.Infof("current status run: [%s] and TaskRun count: [%d]", run.Name, len(taskRuns))
+	for _, tr := range taskRuns {
+		lbls := tr.GetLabels()
+		iterationStr := lbls[taskloop.GroupName+taskLoopIterationLabelKey]
+		iteration, err := strconv.Atoi(iterationStr)
+		if err != nil {
+			terr := fmt.Errorf("Error converting iteration number in TaskRun %s:  %s", tr.Name, err)
+			run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
+			return terr
+		}
+		status.TaskRuns[tr.Name] = &taskloopv1alpha1.TaskLoopTaskRunStatus{
+			Iteration: iteration,
+			Status:    &tr.Status,
+		}
+
+		if tr.CreationTimestamp.Before(run.Status.CompletionTime) {
+			run.Status.CompletionTime = tr.CreationTimestamp.DeepCopy()
+		}
+
+		// 得到最后的
+		if iteration > currentIteration {
+			currentIteration = iteration
+			lastTaskRun = tr
+		} else {
+			logger.Infof("found unexpected iter %d %d", currentIteration, iteration)
+		}
+	}
+	logger.Infof("found last TaskRun run: [%s] TaskRun: [%s]", run.Name, lastTaskRun.Name)
+
+	// 证明之前有过taskrun，这里需要对任务的结果进行校验，确定是否，需要把任务重新扔回队列
+	if !lastTaskRun.IsDone() {
+		logger.Infof("last TaskRun still running, run name %s and task %s", run.Name, lastTaskRun.Name)
+		run.Status.MarkRunRunning(taskloopv1alpha1.TaskLoopRunReasonRunning.String(), "Loop task running: %s", run.Name)
+		return nil
+	}
+
+	if lastTaskRun.IsSuccessful() {
+		taskRunResults := lastTaskRun.Status.TaskRunResults
+		if taskRunResults == nil || len(taskRunResults) != 1 {
+			terr := fmt.Errorf("unexpected error TaskRunResults should be one, run: [%s] TaskRunResults: [%v]", run.Name, taskRunResults)
+			run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
+			return terr
+		}
+		lastTaskRunResult := taskRunResults[len(taskRunResults)-1]
+		if lastTaskRunResult.Name != "status" {
+			terr := fmt.Errorf("unexpected script error, invalid script result name, run: [%s] lastTaskRunResult: [%+v]", run.Name, lastTaskRunResult)
+			run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
+			return terr
+		}
+		if strings.TrimSpace(lastTaskRunResult.Value) == "SUCCESS" {
+			run.Status.MarkRunSucceeded(taskloopv1alpha1.TaskLoopRunReasonSucceeded.String(), "All TaskRuns completed successfully %s", run.Name)
 			return nil
 		}
 
-		// 新的taskrun在10s后执行
-		requeue = true
+		terr := fmt.Errorf("unexpected TaskRun IsSuccessful but got illegal, run: [%s] results [%+v]", run.Name, lastTaskRunResult)
+		run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
+		return terr
 	}
-	tr, err := c.createTaskRun(ctx, logger, taskLoopSpec, run, 1)
+
+	// 访问后端服务manual approval，得到页面的答复后，确定怎么处理当前任务，当前goroutine卡在此处，只能通过外部api的干预退出
+	var httpEndpointStr string
+	httpEndpoint := run.Spec.GetParam("httpEndpoint")
+	if httpEndpoint != nil && httpEndpoint.Value.StringVal != "" {
+		httpEndpointStr = httpEndpoint.Value.StringVal
+	}
+	var pipelineIdStr string
+	pipelineId := run.Spec.GetParam("pipelineId")
+	if pipelineId != nil && pipelineId.Value.StringVal != "" {
+		pipelineIdStr = pipelineId.Value.StringVal
+	}
+	urlStr := fmt.Sprintf("%s?pipelineId=%s", httpEndpointStr, pipelineIdStr)
+	logger.Infof("wait for 10s to start new TaskRun run: [%s] httpEndpoint: [%s] pipelineId: [%s] last task run: [%+v]", run.Name, httpEndpointStr, pipelineIdStr, lastTaskRun.Status)
+	time.Sleep(10 * time.Second)
+
+	resp, err := httpClient().Get(urlStr)
+	if err != nil {
+		logger.Errorf("")
+		run.Status.MarkRunFailed("UnexpectedHttpErr", fmt.Sprintf("Failed to check http endpoint %s", urlStr))
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		run.Status.MarkRunFailed("UnexpectedHttpStatusCode", fmt.Sprintf("Failed to check http endpoint %s status code %d", urlStr, resp.StatusCode))
+		return err
+	}
+
+	b, _ := ioutil.ReadAll(resp.Body)
+	logger.Infof("http response, url: %s body: %s", urlStr, string(b))
+	hr := httpResponse{}
+	if err := json.Unmarshal(b, &hr); err != nil {
+		run.Status.MarkRunFailed("UnexpectedResponse", fmt.Sprintf("url %s response %s", urlStr, string(b)))
+		return err
+	}
+
+	// http response处理
+	if hr.Status == Pending {
+		logger.Infof("http response pending continue wait, run %s", run.Name)
+		run.Status.MarkRunRunning("PendingResponse", fmt.Sprintf("url %s response %s", urlStr, string(b)))
+		return nil
+	}
+	if hr.Status != Success && hr.Status != Fail {
+		err := fmt.Errorf("unexpected http response url: %s response: %s", urlStr, string(b))
+		run.Status.MarkRunFailed("UnexpectedStatus", err.Error())
+		return err
+	}
+
+	// 等待
+	nextIteration := len(taskRuns) + 1
+	tr, err := c.createTaskRun(ctx, logger, taskLoopSpec, run, nextIteration)
 	if err != nil {
 		return fmt.Errorf("error creating TaskRun from Run %s: %w", run.Name, err)
 	}
 	status.TaskRuns[tr.Name] = &taskloopv1alpha1.TaskLoopTaskRunStatus{
-		Iteration: 1,
+		Iteration: nextIteration,
 		Status:    &tr.Status,
 	}
-	run.Status.MarkRunRunning(taskloopv1alpha1.TaskLoopRunReasonRunning.String(),
-		"Loop task run: %s", tr.Name)
-	if requeue {
-		logger.Infof("start wait param: [%+v] tr: [%+v]", run.Spec.Params, tr)
-		// TODO 使用和wait-task同样机制vendor过不去
-		time.Sleep(10 * time.Second)
-	}
+	logger.Infof("create TaskRun success name: %s run: %s", tr.Name, run.Name)
+	run.Status.MarkRunRunning(taskloopv1alpha1.TaskLoopRunReasonRunning.String(), "Loop task running: %s", run.Name)
+
 	return nil
+}
+
+const (
+	Success = "SUCCESS"
+	Fail    = "FAIL"
+	Pending = "PENDING"
+)
+
+type httpResponse struct {
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+
+	// pre-publish/publish场景：
+	// []*v1alpha1.RunResult{
+	// 	{"name": "JENKINS_JOB_NAME", "value": ""},
+	// 	{"name": "JENKINS_BUILD_NO", "value": ""},
+	// 	{"name": "JENKINS_BUILD_URL", "value": ""},
+	// 	{"name": "JENKINS_BUILD_TYPE", "value": ""},
+	// }
+	Kvs []v1alpha1.RunResult `json:"kvs"`
+}
+
+func httpClient() *http.Client {
+	httpDialContextFunc := (&net.Dialer{Timeout: 1 * time.Second, DualStack: true}).DialContext
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: httpDialContextFunc,
+
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 0,
+
+			MaxIdleConns:        50,
+			MaxIdleConnsPerHost: 50,
+		},
+		Timeout: 3 * time.Second,
+	}
 }
 
 func (c *Reconciler) getTaskLoop(ctx context.Context, run *v1alpha1.Run) (*metav1.ObjectMeta, *taskloopv1alpha1.TaskLoopSpec, error) {
