@@ -44,6 +44,10 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 		logger.Info("Run is finished, done reconciling")
 		return nil
 	}
+	if r.IsCancelled() {
+		logger.Info("Run is canceled, done reconciling")
+		return nil
+	}
 
 	if r.Spec.Ref == nil ||
 		r.Spec.Ref.APIVersion != "example.dev/v0" || r.Spec.Ref.Kind != "Wait" {
@@ -72,13 +76,8 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 	if httpEndpoint != nil && httpEndpoint.Value.StringVal != "" {
 		httpEndpointStr = httpEndpoint.Value.StringVal
 	}
-	var pipelineIdStr string
-	pipelineId := r.Spec.GetParam("pipelineId")
-	if pipelineId != nil && pipelineId.Value.StringVal != "" {
-		pipelineIdStr = pipelineId.Value.StringVal
-	}
 
-	logger.Infof("yaml params: duration %s httpEndpoint %s pipelineId %s", dur.String(), httpEndpointStr, pipelineIdStr)
+	logger.Infof("yaml params: duration %s httpEndpoint %s pipelinerunId %s", dur.String(), httpEndpointStr, r.Name)
 
 	// 参数校验只在多的时候起作用
 	if len(r.Spec.Params) > 3 {
@@ -100,8 +99,8 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 	}
 
 	// 增加httpEndpoint属性，获取当前任务状态
-	if httpEndpointStr != "" && pipelineIdStr != "" {
-		urlStr := fmt.Sprintf("%s?pipelineId=%s", httpEndpointStr, pipelineIdStr)
+	if httpEndpointStr != "" {
+		urlStr := fmt.Sprintf("%s?pipelinerunId=%s&taskName=%s", httpEndpointStr, r.Name, r.Spec.Ref.Name)
 		resp, err := httpClient().Get(urlStr)
 		if err != nil {
 			// requeue
