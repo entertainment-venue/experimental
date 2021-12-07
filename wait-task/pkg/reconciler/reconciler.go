@@ -76,14 +76,24 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 	if httpEndpoint != nil && httpEndpoint.Value.StringVal != "" {
 		httpEndpointStr = httpEndpoint.Value.StringVal
 	}
-
-	logger.Infof("yaml params: duration %s httpEndpoint %s pipelinerunId %s", dur.String(), httpEndpointStr, r.Name)
+	var pipelinerunIdStr string
+	pipelinerunId := r.Spec.GetParam("pipelinerunId")
+	if pipelinerunId != nil && pipelinerunId.Value.StringVal != "" {
+		pipelinerunIdStr = pipelinerunId.Value.StringVal
+	}
+	// FIXME r中获取不到运行任务的名称，所以这里通过参数带上
+	var waitTaskNameStr string
+	waitTaskName := r.Spec.GetParam("waitTaskName")
+	if waitTaskName != nil && waitTaskName.Value.StringVal != "" {
+		waitTaskNameStr = waitTaskName.Value.StringVal
+	}
+	logger.Infof("yaml params: duration: %s httpEndpoint: %s pipelinerunId: %s waitTaskName: %s", dur.String(), httpEndpointStr, pipelinerunIdStr, waitTaskNameStr)
 
 	// 参数校验只在多的时候起作用
-	if len(r.Spec.Params) > 3 {
+	if len(r.Spec.Params) > 4 {
 		var found []string
 		for _, p := range r.Spec.Params {
-			if p.Name == "duration" || p.Name == "httpEndpoint" || p.Name == "pipelineId" {
+			if p.Name == "duration" || p.Name == "httpEndpoint" || p.Name == "pipelineId" || p.Name == "waitTaskName" {
 				continue
 			}
 			found = append(found, p.Name)
@@ -100,9 +110,10 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 
 	// 增加httpEndpoint属性，获取当前任务状态
 	if httpEndpointStr != "" {
-		urlStr := fmt.Sprintf("%s?pipelinerunId=%s&taskName=%s", httpEndpointStr, r.Name, r.Spec.Ref.Name)
+		urlStr := fmt.Sprintf("%s?pipelinerunId=%s&taskName=%s", httpEndpointStr, pipelinerunIdStr, waitTaskNameStr)
 		resp, err := httpClient().Get(urlStr)
 		if err != nil {
+			logger.Errorf("pipelinerunId %s err %s", pipelinerunIdStr, err.Error())
 			// requeue
 			r.Status.MarkRunRunning("UnexpectedHttpErr", fmt.Sprintf("Failed to check http endpoint %s", urlStr))
 			return controller.NewRequeueAfter(dur)
@@ -111,17 +122,21 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 		// 解析resp，判断是否可以继续当前的pipeline
 		defer resp.Body.Close()
 
+		b, _ := ioutil.ReadAll(resp.Body)
+		logger.Infof("http response, url: %s body: %s", urlStr, string(b))
+
 		if resp.StatusCode != http.StatusOK {
+			logger.Errorf("pipelinerunId %s err %s", pipelinerunIdStr, fmt.Errorf("status error: %d", resp.StatusCode))
+
 			// requeue
 			r.Status.MarkRunRunning("UnexpectedHttpStatusCode", fmt.Sprintf("Failed to check http endpoint %s status code %d", urlStr, resp.StatusCode))
 			return controller.NewRequeueAfter(dur)
 		}
 
-		b, _ := ioutil.ReadAll(resp.Body)
-		logger.Infof("http response, url: %s body: %s", urlStr, string(b))
-
 		hr := httpResponse{}
 		if err := json.Unmarshal(b, &hr); err != nil {
+			logger.Errorf("pipelinerunId %s err %s", pipelinerunIdStr, err.Error())
+
 			// requeue
 			r.Status.MarkRunRunning("UnexpectedResponse", fmt.Sprintf("url %s response %s", urlStr, string(b)))
 			return controller.NewRequeueAfter(dur)
