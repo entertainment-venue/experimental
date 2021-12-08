@@ -260,23 +260,15 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 
 	if lastTaskRun.IsSuccessful() {
 		taskRunResults := lastTaskRun.Status.TaskRunResults
-		if taskRunResults == nil || len(taskRunResults) != 1 {
-			terr := fmt.Errorf("unexpected error TaskRunResults should be one, run: [%s] TaskRunResults: [%v]", run.Name, taskRunResults)
-			run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
-			return nil
+		for _, result := range taskRunResults {
+			if result.Name == "status" {
+				if strings.TrimSpace(result.Value) == "SUCCESS" {
+					run.Status.MarkRunSucceeded(taskloopv1alpha1.TaskLoopRunReasonSucceeded.String(), "All TaskRuns completed successfully %s", run.Name)
+					return nil
+				}
+			}
 		}
-		lastTaskRunResult := taskRunResults[len(taskRunResults)-1]
-		if lastTaskRunResult.Name != "status" {
-			terr := fmt.Errorf("unexpected script error, invalid script result name, run: [%s] lastTaskRunResult: [%+v]", run.Name, lastTaskRunResult)
-			run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
-			return nil
-		}
-		if strings.TrimSpace(lastTaskRunResult.Value) == "SUCCESS" {
-			run.Status.MarkRunSucceeded(taskloopv1alpha1.TaskLoopRunReasonSucceeded.String(), "All TaskRuns completed successfully %s", run.Name)
-			return nil
-		}
-
-		terr := fmt.Errorf("unexpected TaskRun IsSuccessful but got illegal, run: [%s] results [%+v]", run.Name, lastTaskRunResult)
+		terr := fmt.Errorf("unexpected TaskRun IsSuccessful but got status SUCCESS, run: [%s] results [%+v]", run.Name, taskRunResults)
 		run.Status.MarkRunFailed(taskloopv1alpha1.TaskLoopRunReasonFailedValidation.String(), terr.Error())
 		return terr
 	}
