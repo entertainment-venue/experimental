@@ -17,8 +17,10 @@ limitations under the License.
 package tasklooprun
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -78,6 +80,8 @@ var (
 	// Check that our Reconciler implements runreconciler.Interface
 	_                runreconciler.Interface = (*Reconciler)(nil)
 	cancelPatchBytes []byte
+
+	errRequeue = errors.New("requeue")
 )
 
 func init() {
@@ -131,6 +135,10 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, run *v1alpha1.Run) pkgre
 		logger.Infof("Run %s/%s is done", run.Namespace, run.Name)
 		return nil
 	}
+	if run.IsCancelled() {
+		logger.Infof("Run %s/%s is canceled", run.Namespace, run.Name)
+		return nil
+	}
 
 	// Store the condition before reconcile
 	beforeCondition := run.Status.GetCondition(apis.ConditionSucceeded)
@@ -144,6 +152,10 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, run *v1alpha1.Run) pkgre
 
 	// Reconcile the Run
 	if err := c.reconcile(ctx, run, status); err != nil {
+		if err == errRequeue {
+			return err
+		}
+
 		logger.Errorf("Reconcile error: %v", err.Error())
 		merr = multierror.Append(merr, err)
 	}
@@ -279,51 +291,72 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 	if httpEndpoint != nil && httpEndpoint.Value.StringVal != "" {
 		httpEndpointStr = httpEndpoint.Value.StringVal
 	}
-	var pipelineIdStr string
-	pipelineId := run.Spec.GetParam("pipelineId")
-	if pipelineId != nil && pipelineId.Value.StringVal != "" {
-		pipelineIdStr = pipelineId.Value.StringVal
+	var pipelinerunIdStr string
+	pipelinerunId := run.Spec.GetParam("pipelinerunId")
+	if pipelinerunId != nil && pipelinerunId.Value.StringVal != "" {
+		pipelinerunIdStr = pipelinerunId.Value.StringVal
 	}
-	urlStr := fmt.Sprintf("%s?pipelineId=%s", httpEndpointStr, pipelineIdStr)
-	logger.Infof("wait for 10s to start new TaskRun run: [%s] httpEndpoint: [%s] pipelineId: [%s] last task run: [%+v]", run.Name, httpEndpointStr, pipelineIdStr, lastTaskRun.Status)
-	time.Sleep(10 * time.Second)
+	var waitTaskNameStr string
+	waitTaskName := run.Spec.GetParam("waitTaskName")
+	if waitTaskName != nil && waitTaskName.Value.StringVal != "" {
+		waitTaskNameStr = waitTaskName.Value.StringVal
+	}
 
+	urlStr := fmt.Sprintf("%s?pipelinerunId=%s&taskName=%s", httpEndpointStr, pipelinerunIdStr, waitTaskNameStr)
+	logger.Infof(
+		"check SUCCESS [%s] to start new TaskRun run: [%s] httpEndpoint: [%s] pipelinerunId: [%s] waitTaskName: [%s] last task run: [%+v]",
+		urlStr,
+		run.Name,
+		httpEndpointStr,
+		pipelinerunIdStr,
+		waitTaskNameStr,
+		lastTaskRun.Status)
 	resp, err := httpClient().Get(urlStr)
 	if err != nil {
-		logger.Errorf("")
-		run.Status.MarkRunFailed("UnexpectedHttpErr", fmt.Sprintf("Failed to check http endpoint %s", urlStr))
-		return nil
+		logger.Errorf("pipelinerunId %s err %s", pipelinerunIdStr, err.Error())
+		markTaskPending(ctx, run, httpEndpointStr, pipelinerunIdStr, waitTaskNameStr)
+		return errRequeue
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		run.Status.MarkRunFailed("UnexpectedHttpStatusCode", fmt.Sprintf("Failed to check http endpoint %s status code %d", urlStr, resp.StatusCode))
-		return nil
+		logger.Errorf("pipelinerunId %s status err %d", pipelinerunIdStr, resp.StatusCode)
+		markTaskPending(ctx, run, httpEndpointStr, pipelinerunIdStr, waitTaskNameStr)
+		return errRequeue
 	}
 
 	b, _ := ioutil.ReadAll(resp.Body)
-	logger.Infof("http response, url: %s body: %s", urlStr, string(b))
+	logger.Infof("pipelinerunId %s http response, url: %s body: %s", pipelinerunIdStr, urlStr, string(b))
 	hr := httpResponse{}
 	if err := json.Unmarshal(b, &hr); err != nil {
-		run.Status.MarkRunFailed("UnexpectedResponse", fmt.Sprintf("url %s response %s", urlStr, string(b)))
-		return nil
+		markTaskPending(ctx, run, httpEndpointStr, pipelinerunIdStr, waitTaskNameStr)
+		return errRequeue
 	}
 
 	// http response处理
 	if hr.Status == Pending {
-		logger.Infof("http response pending continue wait, run %s", run.Name)
-		run.Status.MarkRunRunning("PendingResponse", fmt.Sprintf("url %s response %s", urlStr, string(b)))
-		return nil
-	} else if hr.Status == Fail {
-		err := fmt.Errorf("not approval, url: %s response: %s", urlStr, string(b))
+		logger.Infof("pipelinerunId %s http response pending continue wait, run %s", pipelinerunIdStr, run.Name)
+		markTaskPending(ctx, run, httpEndpointStr, pipelinerunIdStr, waitTaskNameStr)
+		return errRequeue
+	}
+
+	if hr.Status == Fail {
+		err := fmt.Errorf("pipelinerunId %s not approval, url: %s response: %s", pipelinerunIdStr, urlStr, string(b))
+		logger.Errorf("%s", err.Error())
 		run.Status.MarkRunFailed("NotApproval", err.Error())
 		return nil
 	}
 
 	// Status状态未知，直接标记失败
 	if hr.Status != Success {
-		err := fmt.Errorf("unexpected status url: %s response: %s", urlStr, string(b))
+		err := fmt.Errorf("pipelinerunId %s unexpected status url: %s response: %s", pipelinerunIdStr, urlStr, string(b))
+		logger.Errorf("%s", err.Error())
 		run.Status.MarkRunFailed("UnexpectedStatus", err.Error())
 		return nil
+	}
+
+	// 需要标记PENDING才能requeue，如果markTaskPending报错，自动重试
+	if err := markTaskPending(ctx, run, httpEndpointStr, pipelinerunIdStr, waitTaskNameStr); err != nil {
+		return err
 	}
 
 	// 等待
@@ -336,9 +369,46 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 		Iteration: nextIteration,
 		Status:    &tr.Status,
 	}
-	logger.Infof("create TaskRun success name: %s run: %s", tr.Name, run.Name)
+	logger.Infof("pipelinerunId %s create TaskRun success name: %s run: %s", pipelinerunIdStr, tr.Name, run.Name)
 	run.Status.MarkRunRunning(taskloopv1alpha1.TaskLoopRunReasonRunning.String(), "Loop task running: %s", run.Name)
 
+	return nil
+}
+
+func markTaskPending(ctx context.Context, run *v1alpha1.Run, httpEndpoint, pipelinerunId, taskName string) error {
+	run.Status.MarkRunRunning(taskloopv1alpha1.TaskLoopRunReasonFailed.String(), "ManualApprovalRetry")
+
+	logger := logging.FromContext(ctx)
+
+	logger.Infof(
+		"pending httpEndpoint: [%s] pipelinerunId: [%s] waitTaskName: [%s]",
+		httpEndpoint,
+		pipelinerunId,
+		taskName)
+
+	raw := struct {
+		PipelineRunId string `json:"pipelinerunId"`
+		TaskName      string `json:"taskName"`
+		Status        string `json:"status"`
+	}{
+		PipelineRunId: pipelinerunId,
+		TaskName:      taskName,
+		Status:        Pending,
+	}
+	body, _ := json.Marshal(raw)
+
+	resp, err := httpClient().Post(httpEndpoint, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		logger.Errorf("pipelinerunId %s err %s", pipelinerunId, err.Error())
+		return errRequeue
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		logger.Errorf("pipelinerunId %s status err %s", pipelinerunId, resp.StatusCode)
+		return errRequeue
+	}
+	b, _ := ioutil.ReadAll(resp.Body)
+	logger.Infof("pipelinerunId %s pending http response, url: %s body: %s", pipelinerunId, httpEndpoint, string(b))
 	return nil
 }
 
