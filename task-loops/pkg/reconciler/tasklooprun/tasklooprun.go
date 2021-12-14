@@ -277,7 +277,7 @@ func (c *Reconciler) reconcile(ctx context.Context, run *v1alpha1.Run, status *t
 				if strings.TrimSpace(result.Value) == "SUCCESS" {
 					// 结果需要带上给loop，否则pipeline中后续的任务拿不到task的运行结果，因为中间有一层run
 					for _, result := range taskRunResults {
-						run.Status.Results = append(run.Status.Results, v1alpha1.RunResult{Name: result.Name, Value: result.Value})
+						run.Status.Results = append(run.Status.Results, v1alpha1.RunResult{Name: result.Name, Value: strings.TrimSpace(result.Value)})
 					}
 					run.Status.MarkRunSucceeded(taskloopv1alpha1.TaskLoopRunReasonSucceeded.String(), "All TaskRuns completed successfully %s", run.Name)
 					return nil
