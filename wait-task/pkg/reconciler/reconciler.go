@@ -90,17 +90,18 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 	logger.Infof("yaml params: duration: %s httpEndpoint: %s pipelinerunId: %s waitTaskName: %s", dur.String(), httpEndpointStr, pipelinerunIdStr, waitTaskNameStr)
 
 	// 参数校验只在多的时候起作用
-	if len(r.Spec.Params) > 4 {
-		var found []string
-		for _, p := range r.Spec.Params {
-			if p.Name == "duration" || p.Name == "httpEndpoint" || p.Name == "pipelineId" || p.Name == "waitTaskName" {
-				continue
-			}
-			found = append(found, p.Name)
-		}
-		r.Status.MarkRunFailed("UnexpectedParams", "Found unexpected params: %v", found)
-		return nil
-	}
+	// if len(r.Spec.Params) > 4 {
+	// 	var found []string
+	// 	for _, p := range r.Spec.Params {
+	// 		if p.Name == "duration" || p.Name == "httpEndpoint" || p.Name == "pipelineId" || p.Name == "waitTaskName" {
+	// 			continue
+	// 		}
+	// 		found = append(found, p.Name)
+	// 	}
+	// 	logger.Errorf("params error %+v", r.Spec.Params)
+	// 	r.Status.MarkRunFailed("UnexpectedParams", "Found unexpected params: %v", found)
+	// 	return nil
+	// }
 
 	if r.Status.StartTime == nil {
 		now := metav1.Now()
@@ -155,6 +156,7 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, r *v1alpha1.Run) kreconc
 		r.Status.MarkRunRunning("Checking", fmt.Sprintf("Got response %s %s", urlStr, string(b)))
 		return controller.NewRequeueAfter(dur)
 	} else {
+		logger.Error("empty httpEndpoint")
 		done := r.Status.StartTime.Time.Add(dur)
 
 		if time.Now().After(done) {
